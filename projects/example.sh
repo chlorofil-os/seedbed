@@ -1,10 +1,9 @@
 # seedbed project template: copy to ~/.config/seedbed/projects/<project>.sh and edit.
-# Every SB_* setting and hook is listed in the README; anything unset keeps its default.
-# shellcheck disable=SC2034  # SB_* settings are read by seedbed after it sources this file
+# shellcheck disable=SC2034
 
-SB_SUBNET=10.226.20             # bridge <SB_SUBNET>.1/24; template .10, clones .11-.99
-SB_NET=examplebr0               # one bridge per project: seedbed owns its raw.dnsmasq
-SB_TLD=example                  # machines answer as <name>.example and *.<name>.example
+SB_SUBNET=10.226.20
+SB_NET=examplebr0
+SB_TLD=example
 SB_POOL_SIZE=40GiB
 
 EX_REPO=git@github.com:you/app.git

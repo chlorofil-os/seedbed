@@ -1,20 +1,5 @@
 # seedbed project: the ChloroFilOS suite (chlorofil-os/chlorofil + chlorofil-os/chlorofil-app).
-#
-# Inside a machine, the layout the repos' CLAUDE.md files expect:
-#   ~/workspace/chlorofil              framework   (compose `web`: Vite :9000)
-#   ~/workspace/chlorofil-app          starter app (compose `web`: Vite :9100, `proxy`: prod build)
-#   ~/workspace/chlorofil-worktrees    worktrees + .heavy.lock
-#   ~/workspace/.seedbed-front         Caddy on the machine's network, in front of both
-#
-# Both Vite configs set allowedHosts: ["web"], so the front proxy rewrites Host to `web`. It
-# listens on the same ports Vite would (9000, 9100), so HMR's websocket finds it, and serves HTTPS
-# from its own local CA (secure context). The CA lives in a volume copied from the template, so
-# every machine shares it: `seedbed chlorofil ca <name>` saves it for importing into Chrome.
-#
-# @chlorofil-os/* come from GitHub Packages: chlorofil-app installs only with a read:packages token
-# (NODE_AUTH_TOKEN). Put it in ~/.config/seedbed/chlorofil.conf as CHLOROFIL_NPM_TOKEN=..., or run
-# `seedbed chlorofil token <name>` later. Without it the template holds the framework only.
-# shellcheck disable=SC2034  # SB_* settings are read by seedbed after it sources this file
+# shellcheck disable=SC2034
 
 SB_BASE=chlorofil-base
 SB_POOL=chlorofil
@@ -22,6 +7,8 @@ SB_POOL_SIZE=80GiB
 SB_NET=cflbr0
 SB_SUBNET=10.226.10
 SB_TLD=cfl
+SB_LIMIT_CPU=4
+SB_LIMIT_MEMORY=8GiB
 SB_PACKAGES="git make curl ca-certificates jq unzip"
 SB_LAUNCHER=$HOME/Desktop/chlorofil.cfl.desktop
 SB_LAUNCHER_CREATE=1
@@ -38,8 +25,7 @@ CFL_CADDY_IMAGE=caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9
 
 cfl_token() { echo "${CHLOROFIL_NPM_TOKEN:-${NODE_AUTH_TOKEN:-}}"; }
 
-# .env (compose UID/GID, app token) and docker-compose.override.yml (loopback ports for the front).
-# Both files are gitignored in the repos. The token goes over stdin, never on a command line.
+# Writes each repo's .env and docker-compose.override.yml.
 cfl_write_local() {
     local name=$1
     sb_ssh "$name" "cat > $CFL_FW/.env" <<'EOF'
@@ -47,16 +33,16 @@ UID=1000
 GID=1000
 EOF
     sb_ssh "$name" "cat > $CFL_FW/docker-compose.override.yml" <<'EOF'
-# Written by seedbed: loopback ports for the front proxy (~/workspace/.seedbed-front).
+# Written by seedbed.
 services:
   web:
     ports:
       - "127.0.0.1:19000:9000"
 EOF
-    { printf 'UID=1000\nGID=1000\n'; local t; t=$(cfl_token); [ -n "$t" ] && printf 'NODE_AUTH_TOKEN=%s\n' "$t"; } \
+    { printf 'UID=1000\nGID=1000\n'; local t; t=$(cfl_token); if [ -n "$t" ]; then printf 'NODE_AUTH_TOKEN=%s\n' "$t"; fi; } \
         | sb_ssh "$name" "umask 077; cat > $CFL_APP/.env"
     sb_ssh "$name" "cat > $CFL_APP/docker-compose.override.yml" <<'EOF'
-# Written by seedbed: loopback ports for the front proxy (~/workspace/.seedbed-front).
+# Written by seedbed.
 services:
   web:
     ports:
@@ -70,7 +56,7 @@ EOF
 cfl_write_front() {
     local name=$1
     sb_ssh "$name" "mkdir -p $CFL_FRONT && cat > $CFL_FRONT/Caddyfile" <<'EOF'
-# Written by seedbed. Vite only accepts Host "web" (allowedHosts), so rewrite it.
+# Written by seedbed.
 {
 	local_certs
 	skip_install_trust
@@ -89,7 +75,6 @@ https://app.{$DEV_DOMAIN}:9100 {
 	}
 }
 
-# chlorofil-app's production image behind its own Caddy (docker compose up -d --build nginx proxy).
 https://prod.{$DEV_DOMAIN}:8443 {
 	reverse_proxy https://127.0.0.1:18443 {
 		header_up Host localhost
@@ -106,7 +91,7 @@ https://prod.{$DEV_DOMAIN}:8443 {
 }
 EOF
     sb_ssh "$name" "cat > $CFL_FRONT/compose.yml" <<EOF
-# Written by seedbed: the machine's front proxy (host network, ports 80, 9000, 9100, 8443).
+# Written by seedbed.
 name: seedbed-front
 services:
   caddy:
@@ -126,7 +111,7 @@ EOF
     sb_ssh "$name" "echo DEV_DOMAIN=$name.$SB_TLD > $CFL_FRONT/.env && cd $CFL_FRONT && docker compose up -d --force-recreate 2>&1 | tail -1"
 }
 
-# The app needs the token to install; with node_modules already in its volume it starts without one.
+# True when chlorofil-app can start: a token, or node_modules already installed.
 cfl_app_ready() {
     local name=$1
     [ -n "$(cfl_token)" ] && return 0
@@ -143,7 +128,7 @@ cfl_up() {
     fi
 }
 
-# Wait until Vite answers through the front (the first start runs npm ci inside the container).
+# Waits for https://<host>.<name>.cfl:<port>/ to return 200.
 cfl_wait() {
     local name=$1 host=$2 port=$3 code
     for _ in $(seq 1 90); do
@@ -184,7 +169,7 @@ sb_verify() {
     if [ -n "$(cfl_token)" ]; then cfl_wait "$SB_BASE" app 9100 || die "app dev server not answering"; fi
 }
 
-# branch: "<framework branch>", "app:<app branch>", or both comma-separated.
+# $2: "<framework branch>", "app:<app branch>", or both comma-separated.
 sb_after_clone() {
     local name=$1 spec=${2:-} part
     cfl_write_local "$name"

@@ -61,9 +61,6 @@ cmd_projects() {
 
 usage() { sed -n "2,/^set -euo/{/^set -euo/!p}" "$0" | sed 's/^# \{0,1\}//'; }
 
-# ---------------------------------------------------------------------------------------------
-# Settings. Defaults first; the project file and then the local .conf override them.
-
 load_project() {
     SB_PROJECT=$1
     SB_BASE=$SB_PROJECT-base
@@ -72,13 +69,13 @@ load_project() {
     SB_POOL_DRIVER=btrfs
     SB_POOL_SIZE=100GiB
     SB_NET=lxdbr0
-    SB_SUBNET=""                  # first three octets, e.g. 10.226.10 (the bridge is <SB_SUBNET>.1/24)
+    SB_SUBNET=""
     SB_BASE_HOST=10
     SB_FIRST_HOST=11
     SB_LAST_HOST=99
-    SB_TLD=lxc                    # machines answer as <name>.<SB_TLD> and *.<name>.<SB_TLD>
-    SB_DNS_DOMAINS=""             # routing domains for the host unit; default "~<SB_TLD>"
-    SB_IP_KEY=user.$SB_PROJECT.ip # instance config key holding the pinned IP; marks project machines
+    SB_TLD=lxc
+    SB_DNS_DOMAINS=""
+    SB_IP_KEY=user.$SB_PROJECT.ip
     SB_KEY=$HOME/.ssh/id_$SB_PROJECT-lxc
     SB_KNOWN=$HOME/.ssh/known_hosts_${SB_PROJECT}_lxc
     SB_SSH_MARKER=$SB_PROJECT-lxc
@@ -87,13 +84,16 @@ load_project() {
     SB_PROFILE_DEV=$SB_PROJECT-dev
     SB_PROFILE_CLONE=$SB_PROJECT-clone
     SB_PACKAGES="git make curl ca-certificates jq unzip"
-    SB_DOCKER=1                   # install Docker in the template and allow nesting
-    SB_LAUNCHER=""                # .desktop file whose --host-rules seedbed maintains; empty = none
-    SB_LAUNCHER_CREATE=0          # create SB_LAUNCHER if it is missing
+    SB_DOCKER=1
+    SB_SSH_HOSTS="github.com"
+    SB_LIMIT_CPU=""
+    SB_LIMIT_MEMORY=""
+    SB_LAUNCHER=""
+    SB_LAUNCHER_CREATE=0
     SB_LAUNCHER_TITLE="$SB_PROJECT dev machines"
     SB_LAUNCHER_URL="about:blank"
     SB_CHROME=google-chrome
-    SB_HOST_REPO=""               # host checkout whose git user.name/email is the fallback identity
+    SB_HOST_REPO=""
     SB_GIT_NAME=""
     SB_GIT_EMAIL=""
 
@@ -114,17 +114,14 @@ load_project() {
     [ -n "$SB_SUBNET" ] || die "$file must set SB_SUBNET"
 }
 
-# Hooks a project file may define. Each runs on the host; sb_ssh reaches the machine.
-sb_bootstrap()   { :; }            # template is up, Docker works: clone repos, build, seed data
-sb_verify()      { :; }            # template is about to be snapshotted: fail if it is not usable
-sb_after_clone() { :; }            # $1 name, $2 branch (may be empty): point the stack at <name>.<tld>, start it
-sb_refresh()     { :; }            # template is up: pull, migrate
-sb_urls()        { echo "ssh $1"; } # $1 name: URLs to print, first one goes in `list`
-sb_ssh_extra()   { :; }            # $1 name, $2 ip: extra ~/.ssh/config blocks for the machine
-sb_help()        { :; }            # lines describing the project's own commands (functions pcmd_<cmd>)
-
-# ---------------------------------------------------------------------------------------------
-# LXD helpers.
+# Project hooks; defaults are no-ops.
+sb_bootstrap()   { :; }
+sb_verify()      { :; }
+sb_after_clone() { :; }
+sb_refresh()     { :; }
+sb_urls()        { echo "ssh $1"; }
+sb_ssh_extra()   { :; }
+sb_help()        { :; }
 
 # One line per instance: name<TAB>status<TAB>pinned ip (SB_IP_KEY)<TAB>eth0 network<TAB>eth0 ipv4.address
 instances() {
@@ -163,7 +160,7 @@ wait_ssh() {
     die "$name did not answer ssh within 120s"
 }
 
-# Free address on SB_NET: not pinned by any project, not set on any eth0 of the bridge.
+# First address on SB_NET that no instance pins or sets on eth0.
 next_ip() {
     local used n
     used=$(instances | awk -F'\t' -v net="$SB_NET" '$4 == net {print $3; print $5}')
@@ -181,8 +178,7 @@ pin_ip() {
     lxc config set "$name" user.seedbed.project "$SB_PROJECT"
 }
 
-# The bridge's dnsmasq answers <name>.<tld> and everything under it. It owns raw.dnsmasq
-# for the whole bridge, so give each project that uses seedbed DNS its own bridge.
+# Rewrites the bridge's raw.dnsmasq: <name>.<tld> and its subdomains for every project machine.
 write_dns() {
     local lines="local=/$SB_TLD/"$'\n' n s ip
     while IFS=$'\t' read -r n s ip; do
@@ -224,8 +220,7 @@ open(p, "w").write(s)
 PY
 }
 
-# Chrome maps hostnames itself with --host-rules, so the launcher needs no DNS. One rule pair
-# per machine covers every subdomain. Rules for other TLDs are kept.
+# Rewrites SB_LAUNCHER's --host-rules for this project's TLD, keeping other rules.
 write_launcher() {
     [ -n "$SB_LAUNCHER" ] || return 0
     if [ ! -f "$SB_LAUNCHER" ]; then
@@ -277,9 +272,6 @@ sync_host() {
     write_launcher || warn "launcher not updated"
 }
 
-# ---------------------------------------------------------------------------------------------
-# Profiles: the template one installs Docker through cloud-init; clones skip it.
-
 profile_yaml() {
     local kind=$1
     echo "description: $SB_PROJECT seedbed ($kind)"
@@ -306,6 +298,8 @@ EOF
 EOF
         fi
     fi
+    [ -n "$SB_LIMIT_CPU" ] && echo "  limits.cpu: \"$SB_LIMIT_CPU\""
+    [ -n "$SB_LIMIT_MEMORY" ] && echo "  limits.memory: $SB_LIMIT_MEMORY"
     if [ "$SB_DOCKER" = 1 ]; then
         cat <<EOF
   security.nesting: "true"
@@ -344,9 +338,6 @@ ensure_host() {
     done
 }
 
-# ---------------------------------------------------------------------------------------------
-# Commands.
-
 set_git_identity() {
     local name=$1
     if [ -z "$SB_GIT_NAME" ] || [ -z "$SB_GIT_EMAIL" ]; then
@@ -375,12 +366,23 @@ cmd_bootstrap() {
     lxc start "$SB_BASE" 2>/dev/null || true
     log "waiting for cloud-init"
     lxc exec "$SB_BASE" -- cloud-init status --wait </dev/null >/dev/null || warn "cloud-init reported an error"
+    log "packages: $SB_PACKAGES"
+    lxc exec "$SB_BASE" -- sh -c "export DEBIAN_FRONTEND=noninteractive; apt-get -qq update && apt-get -qq install -y $SB_PACKAGES >/dev/null" </dev/null \
+        || die "package install failed in $SB_BASE"
     if [ "$SB_DOCKER" = 1 ]; then
+        if ! lxc exec "$SB_BASE" -- sh -c 'command -v docker' </dev/null >/dev/null; then
+            log "installing docker"
+            lxc exec "$SB_BASE" -- sh -c "curl -fsSL https://get.docker.com | sh >/dev/null && usermod -aG docker $SB_SSH_USER" </dev/null
+        fi
         lxc exec "$SB_BASE" -- docker run --rm hello-world </dev/null | grep -q 'Hello from Docker' \
             || die "docker does not work inside $SB_BASE"
     fi
     sync_host
     wait_ssh "$SB_BASE"
+    if [ -n "$SB_SSH_HOSTS" ]; then
+        log "known_hosts: $SB_SSH_HOSTS"
+        sb_ssh "$SB_BASE" "mkdir -p ~/.ssh && for h in $SB_SSH_HOSTS; do ssh-keygen -F \$h >/dev/null 2>&1 || ssh-keyscan -t ed25519,ecdsa,rsa \$h 2>/dev/null >> ~/.ssh/known_hosts; done"
+    fi
     set_git_identity "$SB_BASE"
     sb_bootstrap
     log "verifying"

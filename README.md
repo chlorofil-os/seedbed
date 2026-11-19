@@ -71,6 +71,8 @@ Settings that don't belong in a project file, such as git identity and tokens, g
 | `SB_KEY`, `SB_KNOWN` | `~/.ssh/id_<project>-lxc`, `~/.ssh/known_hosts_<project>_lxc` | Key cloud-init authorises; separate known_hosts |
 | `SB_SSH_MARKER` | `<project>-lxc` | Marker of the managed block in `~/.ssh/config` |
 | `SB_IMAGE`, `SB_PACKAGES`, `SB_DOCKER` | `ubuntu:24.04`, git make curl ca-certificates jq unzip, `1` | Template OS. `SB_DOCKER=1` installs Docker and turns on nesting |
+| `SB_LIMIT_CPU`, `SB_LIMIT_MEMORY` | empty | `limits.cpu` / `limits.memory` in both profiles, e.g. `4`, `8GiB` |
+| `SB_SSH_HOSTS` | `github.com` | Hosts scanned into the template's `~/.ssh/known_hosts`, so git over ssh works in every clone |
 | `SB_PROFILE_DEV`, `SB_PROFILE_CLONE` | `<project>-dev`, `<project>-clone` | LXD profiles (written by `bootstrap`) |
 | `SB_LAUNCHER`, `SB_LAUNCHER_CREATE` | empty, `0` | `.desktop` file whose `--host-rules` seedbed maintains; create it if missing (own Chrome user-data-dir) |
 | `SB_HOST_REPO`, `SB_GIT_NAME`, `SB_GIT_EMAIL` | empty | Git identity for machines: `SEEDBED_GIT_NAME`/`_EMAIL` env, then the settings, then the host repo's git config |
