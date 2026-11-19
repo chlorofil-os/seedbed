@@ -1,0 +1,10 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n seedbed projects/*.sh
+      - run: shellcheck -x -s bash -S warning seedbed projects/*.sh
+      - run: ./seedbed help >/dev/null && ./seedbed projects

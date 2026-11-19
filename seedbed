@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+# seedbed - raise LXD dev machines from a template. One stopped template per project,
+# copy-on-write clones per branch or task, with DNS, ~/.ssh/config and a Chrome launcher
+# kept in step. Everything project-specific (repos, stack, URLs) lives in a project file.
+#
+#   seedbed <project> bootstrap             build or finish the template, then snapshot it
+#   seedbed <project> new <name> [branch]   clone the template, pin an IP, run the project's after-clone hook
+#   seedbed <project> list                  this project's machines: state, IP, first URL
+#   seedbed <project> ssh <name> [cmd...]   ssh in as ubuntu with your agent forwarded (for git)
+#   seedbed <project> start|stop <name>
+#   seedbed <project> rm <name> --yes       delete a machine (its data goes with it)
+#   seedbed <project> snapshot <name> [label]
+#   seedbed <project> refresh-base          update the template (project hook), re-take its snapshot
+#   seedbed <project> git-identity <name>   write the git identity into a machine
+#   seedbed <project> urls <name>
+#   seedbed <project> ssh-config            rewrite this project's managed block in ~/.ssh/config
+#   seedbed <project> launcher              rewrite the Chrome launcher's --host-rules
+#   seedbed <project> dns                   rewrite the bridge's wildcard DNS; print the one-time host step
+#   seedbed <project> help                  these commands plus the project's own
+#   seedbed projects                        list the project files seedbed can see
+#
+# Project files: <dir>/<project>.sh, searched in $SEEDBED_PROJECTS (colon-separated),
+# ~/.config/seedbed/projects, then projects/ beside this script. Local settings that do not
+# belong in a project file (git identity, tokens): ~/.config/seedbed/<project>.conf.
+set -euo pipefail
+
+SEEDBED_HOME=$(dirname "$(readlink -f "$0")")
+SEEDBED_CONF_DIR=${SEEDBED_CONF_DIR:-$HOME/.config/seedbed}
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+warn() { echo "  warning: $*" >&2; }
+
+project_dirs() {
+    local IFS=:
+    for d in ${SEEDBED_PROJECTS:-}; do [ -n "$d" ] && echo "$d"; done
+    echo "$SEEDBED_CONF_DIR/projects"
+    echo "$SEEDBED_HOME/projects"
+}
+
+find_project() {
+    local d
+    while read -r d; do
+        [ -f "$d/$1.sh" ] && { echo "$d/$1.sh"; return 0; }
+    done < <(project_dirs)
+    return 1
+}
+
+cmd_projects() {
+    local d f seen=""
+    while read -r d; do
+        for f in "$d"/*.sh; do
+            [ -f "$f" ] || continue
+            local p; p=$(basename "$f" .sh)
+            [[ " $seen " == *" $p "* ]] && continue
+            seen+=" $p"
+            printf '%-16s %s\n' "$p" "$f"
+        done
+    done < <(project_dirs)
+}
+
+usage() { sed -n "2,/^set -euo/{/^set -euo/!p}" "$0" | sed 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------------------------------------
+# Settings. Defaults first; the project file and then the local .conf override them.
+
+load_project() {
+    SB_PROJECT=$1
+    SB_BASE=$SB_PROJECT-base
+    SB_SNAP=golden
+    SB_POOL=$SB_PROJECT
+    SB_POOL_DRIVER=btrfs
+    SB_POOL_SIZE=100GiB
+    SB_NET=lxdbr0
+    SB_SUBNET=""                  # first three octets, e.g. 10.226.10 (the bridge is <SB_SUBNET>.1/24)
+    SB_BASE_HOST=10
+    SB_FIRST_HOST=11
+    SB_LAST_HOST=99
+    SB_TLD=lxc                    # machines answer as <name>.<SB_TLD> and *.<name>.<SB_TLD>
+    SB_DNS_DOMAINS=""             # routing domains for the host unit; default "~<SB_TLD>"
+    SB_IP_KEY=user.$SB_PROJECT.ip # instance config key holding the pinned IP; marks project machines
+    SB_KEY=$HOME/.ssh/id_$SB_PROJECT-lxc
+    SB_KNOWN=$HOME/.ssh/known_hosts_${SB_PROJECT}_lxc
+    SB_SSH_MARKER=$SB_PROJECT-lxc
+    SB_SSH_USER=ubuntu
+    SB_IMAGE=ubuntu:24.04
+    SB_PROFILE_DEV=$SB_PROJECT-dev
+    SB_PROFILE_CLONE=$SB_PROJECT-clone
+    SB_PACKAGES="git make curl ca-certificates jq unzip"
+    SB_DOCKER=1                   # install Docker in the template and allow nesting
+    SB_LAUNCHER=""                # .desktop file whose --host-rules seedbed maintains; empty = none
+    SB_LAUNCHER_CREATE=0          # create SB_LAUNCHER if it is missing
+    SB_LAUNCHER_TITLE="$SB_PROJECT dev machines"
+    SB_LAUNCHER_URL="about:blank"
+    SB_CHROME=google-chrome
+    SB_HOST_REPO=""               # host checkout whose git user.name/email is the fallback identity
+    SB_GIT_NAME=""
+    SB_GIT_EMAIL=""
+
+    local file; file=$(find_project "$SB_PROJECT") || die "no project '$SB_PROJECT' (seedbed projects)"
+    SB_PROJECT_FILE=$file
+    # shellcheck source=/dev/null
+    . "$file"
+    # shellcheck source=/dev/null
+    [ -f "$SEEDBED_CONF_DIR/$SB_PROJECT.conf" ] && . "$SEEDBED_CONF_DIR/$SB_PROJECT.conf"
+
+    SB_GIT_NAME=${SEEDBED_GIT_NAME:-$SB_GIT_NAME}
+    SB_GIT_EMAIL=${SEEDBED_GIT_EMAIL:-$SB_GIT_EMAIL}
+    if [ -n "$SB_HOST_REPO" ]; then
+        [ -n "$SB_GIT_NAME" ] || SB_GIT_NAME=$(git -C "$SB_HOST_REPO" config user.name 2>/dev/null || true)
+        [ -n "$SB_GIT_EMAIL" ] || SB_GIT_EMAIL=$(git -C "$SB_HOST_REPO" config user.email 2>/dev/null || true)
+    fi
+    [ -n "$SB_DNS_DOMAINS" ] || SB_DNS_DOMAINS="~$SB_TLD"
+    [ -n "$SB_SUBNET" ] || die "$file must set SB_SUBNET"
+}
+
+# Hooks a project file may define. Each runs on the host; sb_ssh reaches the machine.
+sb_bootstrap()   { :; }            # template is up, Docker works: clone repos, build, seed data
+sb_verify()      { :; }            # template is about to be snapshotted: fail if it is not usable
+sb_after_clone() { :; }            # $1 name, $2 branch (may be empty): point the stack at <name>.<tld>, start it
+sb_refresh()     { :; }            # template is up: pull, migrate
+sb_urls()        { echo "ssh $1"; } # $1 name: URLs to print, first one goes in `list`
+sb_ssh_extra()   { :; }            # $1 name, $2 ip: extra ~/.ssh/config blocks for the machine
+sb_help()        { :; }            # lines describing the project's own commands (functions pcmd_<cmd>)
+
+# ---------------------------------------------------------------------------------------------
+# LXD helpers.
+
+# One line per instance: name<TAB>status<TAB>pinned ip (SB_IP_KEY)<TAB>eth0 network<TAB>eth0 ipv4.address
+instances() {
+    lxc query '/1.0/instances?recursion=1' | KEY="$SB_IP_KEY" python3 -c '
+import json, os, sys
+key = os.environ["KEY"]
+for i in json.load(sys.stdin):
+    eth = (i.get("expanded_devices") or {}).get("eth0", {})
+    print("\t".join([i["name"], i["status"], i["config"].get(key, ""), eth.get("network", ""), eth.get("ipv4.address", "")]))
+'
+}
+
+# Project machines (those carrying SB_IP_KEY): name<TAB>status<TAB>ip
+machines() { instances | awk -F'\t' '$3 != "" {print $1"\t"$2"\t"$3}'; }
+
+ip_of() { lxc config get "$1" "$SB_IP_KEY" 2>/dev/null; }
+exists() { lxc info "$1" >/dev/null 2>&1; }
+is_ours() { [ -n "$(ip_of "$1")" ]; }
+
+sb_ssh() {
+    local name=$1; shift
+    local ip; ip=$(ip_of "$name"); [ -n "$ip" ] || die "$name has no $SB_IP_KEY (not a $SB_PROJECT machine?)"
+    ssh -A -i "$SB_KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$SB_KNOWN" \
+        -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o LogLevel=ERROR "$SB_SSH_USER@$ip" "$@"
+}
+
+sb_scp() {
+    local src=$1 name=$2 dst=$3
+    scp -q -i "$SB_KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$SB_KNOWN" \
+        -o StrictHostKeyChecking=accept-new "$src" "$SB_SSH_USER@$(ip_of "$name"):$dst"
+}
+
+wait_ssh() {
+    local name=$1
+    for _ in $(seq 1 60); do sb_ssh "$name" true 2>/dev/null && return 0; sleep 2; done
+    die "$name did not answer ssh within 120s"
+}
+
+# Free address on SB_NET: not pinned by any project, not set on any eth0 of the bridge.
+next_ip() {
+    local used n
+    used=$(instances | awk -F'\t' -v net="$SB_NET" '$4 == net {print $3; print $5}')
+    for n in $(seq "$SB_FIRST_HOST" "$SB_LAST_HOST"); do
+        grep -qx "$SB_SUBNET.$n" <<<"$used" || { echo "$SB_SUBNET.$n"; return; }
+    done
+    die "no free address in $SB_SUBNET.$SB_FIRST_HOST-$SB_LAST_HOST"
+}
+
+pin_ip() {
+    local name=$1 ip=$2
+    lxc config device override "$name" eth0 ipv4.address="$ip" >/dev/null 2>&1 \
+        || lxc config device set "$name" eth0 ipv4.address="$ip"
+    lxc config set "$name" "$SB_IP_KEY" "$ip"
+    lxc config set "$name" user.seedbed.project "$SB_PROJECT"
+}
+
+# The bridge's dnsmasq answers <name>.<tld> and everything under it. It owns raw.dnsmasq
+# for the whole bridge, so give each project that uses seedbed DNS its own bridge.
+write_dns() {
+    local lines="local=/$SB_TLD/"$'\n' n s ip
+    while IFS=$'\t' read -r n s ip; do
+        lines+="local=/$n.$SB_TLD/"$'\n'"address=/$n.$SB_TLD/$ip"$'\n'
+    done < <(machines)
+    lxc network set "$SB_NET" raw.dnsmasq "$lines"
+}
+
+write_ssh_config() {
+    local cfg=${SEEDBED_SSH_CONFIG:-$HOME/.ssh/config} begin="# >>> $SB_SSH_MARKER" end="# <<< $SB_SSH_MARKER"
+    local blocks="" n s ip
+    while IFS=$'\t' read -r n s ip; do
+        blocks+="Host $n
+    HostName $ip
+    User $SB_SSH_USER
+    IdentityFile ${SB_KEY/#$HOME/\~}
+    IdentitiesOnly yes
+    UserKnownHostsFile ${SB_KNOWN/#$HOME/\~}
+    StrictHostKeyChecking accept-new
+    ForwardAgent yes
+
+"
+        if [ "$n" != "$SB_BASE" ]; then
+            local extra; extra=$(sb_ssh_extra "$n" "$ip")
+            [ -n "$extra" ] && blocks+="$extra"$'\n\n'
+        fi
+    done < <(machines)
+    BLOCKS="$blocks" BEGIN="$begin" END="$end" python3 - "$cfg" <<'PY'
+import os, sys
+p = sys.argv[1]; s = open(p).read() if os.path.exists(p) else ""
+b, e = os.environ["BEGIN"], os.environ["END"]
+sec = f"{b} (managed by seedbed - edits inside are overwritten)\n{os.environ['BLOCKS'].rstrip()}\n{e}\n"
+if b in s and e in s:
+    i = s.index(b); j = s.index(e, i) + len(e) + 1
+    s = s[:i] + sec + s[j:]
+else:
+    s = s.rstrip("\n") + "\n\n" + sec
+open(p, "w").write(s)
+PY
+}
+
+# Chrome maps hostnames itself with --host-rules, so the launcher needs no DNS. One rule pair
+# per machine covers every subdomain. Rules for other TLDs are kept.
+write_launcher() {
+    [ -n "$SB_LAUNCHER" ] || return 0
+    if [ ! -f "$SB_LAUNCHER" ]; then
+        [ "$SB_LAUNCHER_CREATE" = 1 ] || { warn "$SB_LAUNCHER missing (SB_LAUNCHER_CREATE=0)"; return 0; }
+        mkdir -p "$(dirname "$SB_LAUNCHER")"
+        cat > "$SB_LAUNCHER" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=$SB_LAUNCHER_TITLE
+Comment=Chrome mapped onto the $SB_PROJECT seedbed machines (written by seedbed)
+Exec=$SB_CHROME --user-data-dir=$SEEDBED_CONF_DIR/chrome/$SB_PROJECT --host-rules="" $SB_LAUNCHER_URL
+Icon=google-chrome
+Terminal=false
+EOF
+        chmod +x "$SB_LAUNCHER"
+    fi
+    local rules="" n s ip
+    while IFS=$'\t' read -r n s ip; do
+        rules+="MAP *.$n.$SB_TLD $ip, MAP $n.$SB_TLD $ip, "
+    done < <(machines)
+    RULES="${rules%, }" TLD="$SB_TLD" python3 - "$SB_LAUNCHER" <<'PY'
+import os, re, sys
+path = sys.argv[1]
+text = open(path).read()
+m = re.search(r'^Exec=.*?--host-rules="([^"]*)"', text, re.M)
+if not m:
+    sys.exit(f"error: no --host-rules=\"...\" on the Exec line of {path}")
+tld = re.escape(os.environ["TLD"])
+current = [r.strip() for r in m.group(1).split(",") if r.strip()]
+kept = [r for r in current if not re.match(rf"MAP\s+(\*\.)?\S*\.{tld}\s", r)]
+ours = [r.strip() for r in os.environ["RULES"].split(",") if r.strip()]
+new = text[:m.start(1)] + ", ".join(kept + ours) + text[m.end(1):]
+if new == text:
+    print(f"{path}: already up to date ({len(ours) // 2} machines)")
+    sys.exit(0)
+tmp = path + ".tmp"
+open(tmp, "w").write(new)
+os.chmod(tmp, os.stat(path).st_mode)
+os.replace(tmp, path)
+print(f"{path}: updated - {len(kept)} other rules kept, {len(ours) // 2} machines")
+PY
+    command -v gio >/dev/null && gio set "$SB_LAUNCHER" metadata::trusted true 2>/dev/null || true
+}
+
+sync_host() {
+    write_dns
+    write_ssh_config
+    write_launcher || warn "launcher not updated"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Profiles: the template one installs Docker through cloud-init; clones skip it.
+
+profile_yaml() {
+    local kind=$1
+    echo "description: $SB_PROJECT seedbed ($kind)"
+    echo "config:"
+    if [ "$kind" = dev ]; then
+        cat <<EOF
+  cloud-init.user-data: |
+    #cloud-config
+    users:
+      - name: $SB_SSH_USER
+        groups: [sudo]
+        shell: /bin/bash
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        ssh_authorized_keys:
+          - $(cat "$SB_KEY.pub")
+    package_update: true
+    packages: [${SB_PACKAGES// /, }]
+EOF
+        if [ "$SB_DOCKER" = 1 ]; then
+            cat <<EOF
+    runcmd:
+      - curl -fsSL https://get.docker.com | sh
+      - usermod -aG docker $SB_SSH_USER
+EOF
+        fi
+    fi
+    if [ "$SB_DOCKER" = 1 ]; then
+        cat <<EOF
+  security.nesting: "true"
+  security.syscalls.intercept.mknod: "true"
+  security.syscalls.intercept.setxattr: "true"
+EOF
+    fi
+    cat <<EOF
+devices:
+  eth0:
+    name: eth0
+    network: $SB_NET
+    type: nic
+  root:
+    path: /
+    pool: $SB_POOL
+    type: disk
+EOF
+}
+
+ensure_host() {
+    if ! lxc storage show "$SB_POOL" >/dev/null 2>&1; then
+        log "creating $SB_POOL_DRIVER pool $SB_POOL ($SB_POOL_SIZE)"
+        lxc storage create "$SB_POOL" "$SB_POOL_DRIVER" size="$SB_POOL_SIZE" </dev/null
+    fi
+    if ! lxc network show "$SB_NET" >/dev/null 2>&1; then
+        log "creating bridge $SB_NET ($SB_SUBNET.1/24)"
+        lxc network create "$SB_NET" ipv4.address="$SB_SUBNET.1/24" ipv4.nat=true ipv6.address=none </dev/null
+    fi
+    [ -f "$SB_KEY" ] || { log "generating $SB_KEY"; ssh-keygen -t ed25519 -N '' -C "$SB_PROJECT-lxc" -f "$SB_KEY" -q; }
+    local p kind
+    for kind in dev clone; do
+        p=$SB_PROFILE_DEV; [ "$kind" = clone ] && p=$SB_PROFILE_CLONE
+        lxc profile show "$p" >/dev/null 2>&1 || lxc profile create "$p" </dev/null
+        profile_yaml "$kind" | lxc profile edit "$p"
+    done
+}
+
+# ---------------------------------------------------------------------------------------------
+# Commands.
+
+set_git_identity() {
+    local name=$1
+    if [ -z "$SB_GIT_NAME" ] || [ -z "$SB_GIT_EMAIL" ]; then
+        echo "  (git identity not set on $name: SEEDBED_GIT_NAME/SEEDBED_GIT_EMAIL or $SEEDBED_CONF_DIR/$SB_PROJECT.conf)"
+        return 0
+    fi
+    sb_ssh "$name" "git config --global user.name $(printf %q "$SB_GIT_NAME") && git config --global user.email $(printf %q "$SB_GIT_EMAIL") && echo \"  git identity: \$(git config --global user.name) <\$(git config --global user.email)>\""
+}
+
+snapshot_base() {
+    log "stopping $SB_BASE and re-taking $SB_SNAP"
+    lxc stop "$SB_BASE"
+    lxc delete "$SB_BASE/$SB_SNAP" 2>/dev/null || true
+    lxc snapshot "$SB_BASE" "$SB_SNAP" </dev/null
+}
+
+cmd_bootstrap() {
+    ensure_host
+    local ip=$SB_SUBNET.$SB_BASE_HOST
+    if ! exists "$SB_BASE"; then
+        log "launching $SB_BASE ($ip)"
+        lxc init "$SB_IMAGE" "$SB_BASE" -p "$SB_PROFILE_DEV" </dev/null
+        pin_ip "$SB_BASE" "$ip"
+    fi
+    is_ours "$SB_BASE" || die "$SB_BASE exists but has no $SB_IP_KEY"
+    lxc start "$SB_BASE" 2>/dev/null || true
+    log "waiting for cloud-init"
+    lxc exec "$SB_BASE" -- cloud-init status --wait </dev/null >/dev/null || warn "cloud-init reported an error"
+    if [ "$SB_DOCKER" = 1 ]; then
+        lxc exec "$SB_BASE" -- docker run --rm hello-world </dev/null | grep -q 'Hello from Docker' \
+            || die "docker does not work inside $SB_BASE"
+    fi
+    sync_host
+    wait_ssh "$SB_BASE"
+    set_git_identity "$SB_BASE"
+    sb_bootstrap
+    log "verifying"
+    sb_verify
+    snapshot_base
+    log "done. make a machine: seedbed $SB_PROJECT new <name> [branch]"
+}
+
+cmd_new() {
+    local name=${1:-} branch=${2:-}
+    [[ $name =~ ^[a-z][a-z0-9-]{1,40}$ ]] || die "name must be lowercase letters, digits, dashes"
+    exists "$name" && die "$name already exists"
+    lxc query "/1.0/instances/$SB_BASE/snapshots/$SB_SNAP" >/dev/null 2>&1 \
+        || die "template $SB_BASE/$SB_SNAP missing (seedbed $SB_PROJECT bootstrap)"
+    local ip; ip=$(next_ip)
+    log "cloning $SB_BASE/$SB_SNAP -> $name ($ip)"
+    lxc copy "$SB_BASE/$SB_SNAP" "$name" --profile "$SB_PROFILE_CLONE" </dev/null
+    pin_ip "$name" "$ip"
+    lxc start "$name"
+    sync_host
+    wait_ssh "$name"
+    sb_after_clone "$name" "$branch"
+    lxc snapshot "$name" clean </dev/null
+    log "ready ($ip), reset with: lxc restore $name clean"
+    sb_urls "$name" | sed 's/^/  /'
+}
+
+cmd_list() {
+    printf '%-24s %-8s %-15s %s\n' NAME STATE IP URL
+    local n s ip url
+    while IFS=$'\t' read -r n s ip; do
+        url=$(sb_urls "$n" | head -1); [ "$n" = "$SB_BASE" ] && url="(template)"
+        printf '%-24s %-8s %-15s %s\n' "$n" "$s" "$ip" "$url"
+    done < <(machines)
+}
+
+cmd_rm() {
+    local name=${1:-} yes=${2:-}
+    [ -n "$name" ] || die "usage: rm <name> --yes"
+    [ "$name" = "$SB_BASE" ] && die "refusing to delete the template"
+    exists "$name" || die "$name does not exist"
+    is_ours "$name" || die "$name is not a $SB_PROJECT machine"
+    [ "$yes" = "--yes" ] || die "this deletes $name and everything in it; re-run with --yes"
+    local ip; ip=$(ip_of "$name")
+    lxc delete --force "$name"
+    [ -n "$ip" ] && ssh-keygen -R "$ip" -f "$SB_KNOWN" >/dev/null 2>&1 || true
+    sync_host
+    log "deleted $name"
+}
+
+cmd_refresh_base() {
+    log "starting $SB_BASE"
+    lxc start "$SB_BASE" 2>/dev/null || true
+    wait_ssh "$SB_BASE"
+    set_git_identity "$SB_BASE"
+    sb_refresh
+    snapshot_base
+    log "done; existing machines are unaffected, new ones get the fresh template"
+}
+
+dns_unit() {
+    cat <<EOF
+[Unit]
+Description=Route ${SB_DNS_DOMAINS//\~/} lookups to LXD's $SB_NET dnsmasq (seedbed $SB_PROJECT)
+BindsTo=sys-subsystem-net-devices-$SB_NET.device
+After=sys-subsystem-net-devices-$SB_NET.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/resolvectl dns $SB_NET $SB_SUBNET.1
+ExecStart=/usr/bin/resolvectl domain $SB_NET $SB_DNS_DOMAINS
+ExecStopPost=/usr/bin/resolvectl revert $SB_NET
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sys-subsystem-net-devices-$SB_NET.device
+EOF
+}
+
+cmd_dns() {
+    write_dns
+    local unit=lxd-dns-$SB_NET.service
+    echo "$SB_NET now answers *.<name>.$SB_TLD for every $SB_PROJECT machine."
+    if systemctl is-enabled "$unit" >/dev/null 2>&1; then
+        echo "This host already routes it ($unit is enabled)."
+        return 0
+    fi
+    echo "For THIS host to ask it, run once:"
+    echo
+    echo "sudo tee /etc/systemd/system/$unit >/dev/null <<'UNIT'"
+    dns_unit
+    echo "UNIT"
+    echo "sudo systemctl daemon-reload && sudo systemctl enable --now $unit"
+    echo
+    echo "Check: resolvectl query $SB_BASE.$SB_TLD"
+}
+
+cmd_help() {
+    usage
+    local extra; extra=$(sb_help)
+    [ -n "$extra" ] && { echo; echo "$SB_PROJECT commands ($SB_PROJECT_FILE):"; echo "$extra" | sed 's/^/  /'; }
+    return 0
+}
+
+main() {
+    case "${1:-}" in
+        ""|-h|--help|help) usage; exit 0 ;;
+        projects) cmd_projects; exit 0 ;;
+    esac
+    load_project "$1"; shift
+    local cmd=${1:-help}; [ $# -gt 0 ] && shift
+    case "$cmd" in
+        bootstrap)    cmd_bootstrap ;;
+        new)          cmd_new "$@" ;;
+        list|ls)      cmd_list ;;
+        ssh)          local n=${1:?name}; shift; sb_ssh "$n" "$@" ;;
+        start)        lxc start "${1:?name}"; wait_ssh "$1"; sb_urls "$1" | head -1 ;;
+        stop)         lxc stop "${1:?name}" ;;
+        rm|delete)    cmd_rm "$@" ;;
+        snapshot)     lxc snapshot "${1:?name}" "${2:-snap-$(date +%Y%m%d-%H%M%S)}" </dev/null ;;
+        refresh-base) cmd_refresh_base ;;
+        git-identity) set_git_identity "${1:?name}" ;;
+        urls)         sb_urls "${1:?name}" ;;
+        ssh-config)   write_ssh_config; echo "$(machines | wc -l) $SB_PROJECT machines in ~/.ssh/config" ;;
+        launcher)     [ -n "$SB_LAUNCHER" ] || die "$SB_PROJECT sets no SB_LAUNCHER"; write_launcher ;;
+        dns)          cmd_dns ;;
+        help)         cmd_help ;;
+        *)
+            local fn=pcmd_${cmd//-/_}
+            declare -F "$fn" >/dev/null || { cmd_help; exit 1; }
+            "$fn" "$@" ;;
+    esac
+}
+
+main "$@"
