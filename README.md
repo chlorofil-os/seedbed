@@ -65,6 +65,7 @@ Settings that don't belong in a project file, such as git identity and tokens, g
 | `SB_NET` | `lxdbr0` | Bridge. Created if missing. Seedbed owns its `raw.dnsmasq`, so give each project its own bridge |
 | `SB_TLD` | `lxc` | Machines answer as `<name>.<tld>` and `*.<name>.<tld>` |
 | `SB_DNS_DOMAINS` | `~<tld>` | Routing domains in the host's resolved unit |
+| `SB_LXD_PROJECT` | `<project>` | LXD project the machines live in. Created if missing, sharing profiles, images, networks and storage with `default`; `default` puts them in the default project |
 | `SB_POOL`, `SB_POOL_DRIVER`, `SB_POOL_SIZE` | `<project>`, `btrfs`, `100GiB` | Storage pool. Created if missing; a loop file, sparse |
 | `SB_BASE`, `SB_SNAP` | `<project>-base`, `golden` | Template and its snapshot |
 | `SB_IP_KEY` | `user.<project>.ip` | Instance config key holding the pinned IP. Its presence marks a project machine |

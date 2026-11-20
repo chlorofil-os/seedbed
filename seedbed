@@ -26,6 +26,20 @@ set -euo pipefail
 
 SEEDBED_HOME=$(dirname "$(readlink -f "$0")")
 SEEDBED_CONF_DIR=${SEEDBED_CONF_DIR:-$HOME/.config/seedbed}
+SB_LXD_PROJECT=""
+
+# Every lxc call runs in the project's LXD project once one is loaded.
+lxc() { command lxc ${SB_LXD_PROJECT:+--project "$SB_LXD_PROJECT"} "$@"; }
+
+# Create the LXD project, sharing profiles, images, networks and storage with `default`, so pools, bridges and
+# profiles stay where they are and only the instances are grouped.
+ensure_lxd_project() {
+    [ "$SB_LXD_PROJECT" = default ] && return 0
+    command lxc project show "$SB_LXD_PROJECT" >/dev/null 2>&1 && return 0
+    log "creating LXD project $SB_LXD_PROJECT"
+    command lxc project create "$SB_LXD_PROJECT" -c features.images=false -c features.profiles=false \
+        -c features.storage.volumes=false -c features.storage.buckets=false -c features.networks=false </dev/null
+}
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -66,6 +80,7 @@ load_project() {
     SB_BASE=$SB_PROJECT-base
     SB_SNAP=golden
     SB_POOL=$SB_PROJECT
+    SB_LXD_PROJECT=$SB_PROJECT
     SB_POOL_DRIVER=btrfs
     SB_POOL_SIZE=100GiB
     SB_NET=lxdbr0
@@ -125,7 +140,7 @@ sb_help()        { :; }
 
 # One line per instance: name<TAB>status<TAB>pinned ip (SB_IP_KEY)<TAB>eth0 network<TAB>eth0 ipv4.address
 instances() {
-    lxc query '/1.0/instances?recursion=1' | KEY="$SB_IP_KEY" python3 -c '
+    command lxc query "/1.0/instances?recursion=1&project=$SB_LXD_PROJECT" | KEY="$SB_IP_KEY" python3 -c '
 import json, os, sys
 key = os.environ["KEY"]
 for i in json.load(sys.stdin):
@@ -321,6 +336,7 @@ EOF
 }
 
 ensure_host() {
+    ensure_lxd_project
     if ! lxc storage show "$SB_POOL" >/dev/null 2>&1; then
         log "creating $SB_POOL_DRIVER pool $SB_POOL ($SB_POOL_SIZE)"
         lxc storage create "$SB_POOL" "$SB_POOL_DRIVER" size="$SB_POOL_SIZE" </dev/null
@@ -395,7 +411,7 @@ cmd_new() {
     local name=${1:-} branch=${2:-}
     [[ $name =~ ^[a-z][a-z0-9-]{1,40}$ ]] || die "name must be lowercase letters, digits, dashes"
     exists "$name" && die "$name already exists"
-    lxc query "/1.0/instances/$SB_BASE/snapshots/$SB_SNAP" >/dev/null 2>&1 \
+    command lxc query "/1.0/instances/$SB_BASE/snapshots/$SB_SNAP?project=$SB_LXD_PROJECT" >/dev/null 2>&1 \
         || die "template $SB_BASE/$SB_SNAP missing (seedbed $SB_PROJECT bootstrap)"
     local ip; ip=$(next_ip)
     log "cloning $SB_BASE/$SB_SNAP -> $name ($ip)"
@@ -494,6 +510,11 @@ main() {
     esac
     load_project "$1"; shift
     local cmd=${1:-help}; [ $# -gt 0 ] && shift
+    case "$cmd" in
+        bootstrap|help) ;;
+        *) command lxc project show "$SB_LXD_PROJECT" >/dev/null 2>&1 \
+            || die "no LXD project '$SB_LXD_PROJECT' (seedbed $SB_PROJECT bootstrap creates it, or set SB_LXD_PROJECT)" ;;
+    esac
     case "$cmd" in
         bootstrap)    cmd_bootstrap ;;
         new)          cmd_new "$@" ;;
